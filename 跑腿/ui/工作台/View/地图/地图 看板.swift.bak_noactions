@@ -1,0 +1,823 @@
+import SwiftUI
+import MapKit
+
+/// 分屏：上半卡片看板（可拖拽改状态），下半同城地图（可拖动查看，配送员/订单为小图标）。
+/// 中间分隔条可上下拖动，比例记忆到 UserDefaults；双击复位。
+struct SplitBoard: View {
+    @State private var ratio: Double = SplitBoard.storedRatio
+    @State private var dragStart: Double?
+
+    static let ratioKey = "workbench.splitRatio"
+
+    static var storedRatio: Double {
+        let value = UserDefaults.standard.double(forKey: ratioKey)
+        // 只有用户真正拖过（值落在合理区间）才用，否则用默认 0.6
+        guard value >= 0.3, value <= 0.85 else { return 0.6 }
+        return value
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let handleH: CGFloat = 14
+            let usable = max(260, geo.size.height - handleH)
+            let topH = min(usable - 120, max(120, usable * ratio))
+
+            VStack(spacing: 0) {
+                KanbanView()
+                    .frame(width: geo.size.width, height: topH)
+                    .clipped()
+
+                divider(usable: usable, handleH: handleH)
+
+                MapCanvas()
+                    .frame(width: geo.size.width, height: max(100, usable - topH))
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .clipped()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func divider(usable: CGFloat, handleH: CGFloat) -> some View {
+        ZStack {
+            Rectangle()
+                .fill(.quaternary)
+                .frame(height: 1)
+            Capsule()
+                .fill(.tertiary)
+                .frame(width: 48, height: 5)
+        }
+        .frame(height: handleH)
+        .contentShape(Rectangle())
+        .onHover { inside in
+            if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = ratio }
+                    let base = (dragStart ?? ratio) * usable
+                    ratio = min(0.85, max(0.25, (base + value.translation.height) / usable))
+                }
+                .onEnded { _ in
+                    dragStart = nil
+                    UserDefaults.standard.set(ratio, forKey: SplitBoard.ratioKey)
+                }
+        )
+        .onTapGesture(count: 2) {
+            withAnimation(.smooth(duration: 0.25)) { ratio = 0.6 }
+            UserDefaults.standard.set(ratio, forKey: SplitBoard.ratioKey)
+        }
+        .help("上下拖动调整卡片区与地图高度 · 双击复位")
+    }
+}
+
+/// 地图看板：上排卡片条（横向滚动）+ 下方整块可拖动地图。
+/// 卡片与图钉双向联动：点卡片地图飞过去，点图钉卡片高亮。
+struct MapBoard: View {
+    @Environment(WorkbenchStore.self) private var store
+    @State private var stripExpanded = true
+
+    private var activeOrders: [Order] {
+        store.orders
+            .filter { $0.status != .done && $0.status != .canceled }
+            .filter { store.filterKind == nil || $0.kind == store.filterKind }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            strip
+            Divider().opacity(0.4)
+            MapCanvas()
+        }
+    }
+
+    // MARK: 上排卡片
+
+    private var strip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("在途 \(activeOrders.count) 单")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button {
+                    withAnimation(.smooth(duration: 0.25)) { stripExpanded.toggle() }
+                } label: {
+                    Image(systemName: stripExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, Theme.screenPadding)
+            .padding(.top, 8)
+
+            if stripExpanded {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(activeOrders) { order in
+                            MapOrderChip(order: order,
+                                         isSelected: store.selectedOrderID == order.id,
+                                         distance: nearestRiderDistance(to: order))
+                                .onTapGesture {
+                                    store.selectedOrderID = order.id
+                                    SplitCamera.fly.notify(order.resolvedLocation)
+                                }
+                        }
+                    }
+                    .padding(.horizontal, Theme.screenPadding)
+                    .padding(.bottom, 8)
+                }
+                .scrollIndicators(.hidden)
+                .frame(height: 96)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .background(.bar)
+    }
+
+    private func nearestRiderDistance(to order: Order) -> Double? {
+        store.riders
+            .map { $0.resolvedLocation.distance(to: order.resolvedLocation) }
+            .min()
+    }
+}
+
+/// 相机指令总线：卡片条点击后可让 canvas 飞过去
+@MainActor
+enum SplitCamera {
+    static let fly = FlyBus()
+}
+
+@MainActor
+final class FlyBus {
+    private var handlers: [UUID: (GeoPoint) -> Void] = [:]
+    private var fitHandlers: [UUID: () -> Void] = [:]
+
+    func register(_ id: UUID,
+                  fly: @escaping (GeoPoint) -> Void,
+                  fitAll: @escaping () -> Void) {
+        handlers[id] = fly
+        fitHandlers[id] = fitAll
+    }
+
+    func unregister(_ id: UUID) {
+        handlers[id] = nil
+        fitHandlers[id] = nil
+    }
+
+    func notify(_ point: GeoPoint) {
+        for handler in handlers.values { handler(point) }
+    }
+
+    func notifyFitAll() {
+        for handler in fitHandlers.values { handler() }
+    }
+}
+
+/// 纯地图画布：可拖动，配送员 + 未完成订单以小图标显示。
+///
+/// 为什么不用 `Map { Annotation { ... } }`：
+/// MapKit 内部有一条常开的渲染循环（CVDisplayLink 驱动 VectorKit），**静止时也在逐帧绘制**，
+/// 每帧都会走 mapLayerDidDraw → _updateAnnotationViewsForReason:updatePositions: →
+/// _updateAnchorPosition:alignToPixels:，把所有 annotation 重新排位置并吸附到像素网格。
+/// SwiftUI 的 Annotation 内容还是一个 hosting 视图，每帧还要重做一次布局测量，
+/// 测量值在亚像素之间来回摆，叠加像素吸附后图钉就在相邻两像素之间来回跳 —— 这就是静止时的"抽搐"，
+/// 与是否操作地图完全无关。
+///
+/// 所以这里彻底不用 MapKit annotation：改用 MKMapView 桥接，图钉是盖在地图上的一层普通 NSView，
+/// 位置只在可见区域变化时用 convert 重算，并做整像素取整。静止时既不重排也不吸附，图钉完全不动；
+/// 同时图钉层是地图容器的内部子视图，天然被地图矩形裁剪，不会浮到侧栏和其它 UI 之上。
+struct MapCanvas: View {
+    @Environment(WorkbenchStore.self) private var store
+
+    @State private var busID = UUID()
+
+    private var activeOrders: [Order] {
+        store.orders
+            .filter { $0.status != .done && $0.status != .canceled }
+            .filter { store.filterKind == nil || $0.kind == store.filterKind }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    var body: some View {
+        NativeMapView(
+            orders: activeOrders,
+            riders: store.riders.filter(\.isOnline),
+            selectedOrderID: store.selectedOrderID,
+            busID: busID,
+            onSelectOrder: { id in store.selectedOrderID = id }
+        )
+        .overlay(alignment: .topLeading) {
+            legend
+                .padding(12)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            VStack(spacing: 8) {
+                mapButton("location.fill") {
+                    SplitCamera.fly.notify(store.riders.first?.resolvedLocation ?? GeoPoint.cityCenter)
+                }
+                mapButton("arrow.up.left.and.arrow.down.right") {
+                    SplitCamera.fly.notifyFitAll()
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    private var legend: some View {
+        HStack(spacing: 10) {
+            legendItem(color: OrderStatus.pending.tint, text: "待派单")
+            legendItem(color: OrderStatus.assigned.tint, text: "已派单")
+            legendItem(color: OrderStatus.delivering.tint, text: "配送中")
+            legendItem(color: .green, text: "配送员")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        // 不要在地图上用 glassEffect：玻璃会持续采样底下的地图内容，
+        // 逼着地图反复重绘，是图钉闪跳的帮凶。改用普通材质。
+        .background(.ultraThinMaterial, in: .capsule)
+        .overlay {
+            Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
+        }
+    }
+
+    private func legendItem(color: Color, text: String) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func mapButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .background(.ultraThinMaterial, in: .circle)
+        .overlay {
+            Circle().strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
+        }
+    }
+}
+
+// MARK: - MKMapView 桥接
+
+private struct NativeMapView: NSViewRepresentable {
+    let orders: [Order]
+    let riders: [Rider]
+    let selectedOrderID: UUID?
+    let busID: UUID
+    let onSelectOrder: (UUID) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(busID: busID) }
+
+    func makeNSView(context: Context) -> MapHostView {
+        let host = MapHostView()
+        host.onSelectOrder = onSelectOrder
+        SplitCamera.fly.register(busID,
+                                 fly: { [weak host] point in host?.fly(to: point) },
+                                 fitAll: { [weak host] in host?.fitAll() })
+        host.sync(orders: orders, riders: riders, selected: selectedOrderID)
+        return host
+    }
+
+    func updateNSView(_ nsView: MapHostView, context: Context) {
+        nsView.onSelectOrder = onSelectOrder
+        nsView.sync(orders: orders, riders: riders, selected: selectedOrderID)
+    }
+
+    static func dismantleNSView(_ nsView: MapHostView, coordinator: Coordinator) {
+        SplitCamera.fly.unregister(coordinator.busID)
+    }
+
+    final class Coordinator {
+        let busID: UUID
+        init(busID: UUID) { self.busID = busID }
+    }
+}
+
+// MARK: - 图钉视图
+
+/// 图钉 = MapKit 之上的独立 NSView（不是地图内容、也不由 MapKit 托管）。
+///
+/// 为什么不用 MKAnnotationView：
+/// MapKit 在相机停止/松手后会把注释容器整体重排一次（先归零再摆位），
+/// 那一帧所有图钉都会闪到左上角，这是它内部行为，外部无法阻止。
+///
+/// 为什么不用 MKOverlayRenderer：
+/// overlay 的内容会被当成地图内容参与缩放，缩放动画的中间帧只能拉伸缓存位图，
+/// 于是图钉忽大忽小、还发糊。
+///
+/// 现在这条路：位置由 displayLink 每帧从地图换算（与地图同帧提交，不追帧），
+/// 图钉交给 MapKit 自己的注释管线渲染：位置和瓦片用同一份相机、同一次提交，
+/// 实测与瓦片逐帧同位移（自绘浮层会超前 2 帧，肉眼就是"跟不上"）。
+final class PinAnnotation: NSObject, MKAnnotation {
+    let pinID: UUID
+    let isOrder: Bool
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+    var selected = false
+    var art: PinArt.Art?
+
+    init(id: UUID, isOrder: Bool, coordinate: CLLocationCoordinate2D) {
+        self.pinID = id
+        self.isOrder = isOrder
+        self.coordinate = coordinate
+    }
+}
+
+final class PinAnnotationView: MKAnnotationView {
+    var onTap: ((UUID) -> Void)?
+
+    /// 只关掉位置和尺寸的隐式动画。千万别碰 contents/transform/sublayers，
+    /// 更不要碰 MapKit 自己的 annotation 容器图层——那会把它的两段式布局拍平。
+    static let frozenActions: [String: CAAction] = [
+        "position": NSNull(), "bounds": NSNull(),
+    ]
+
+    override init(annotation: (any MKAnnotation)?, reuseIdentifier: String?) {
+        super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
+        canShowCallout = false
+        collisionMode = .none          // 重叠时不要互相顶掉
+        layer?.actions = Self.frozenActions
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let pin = annotation as? PinAnnotation, pin.isOrder else {
+            super.mouseDown(with: event)
+            return
+        }
+        onTap?(pin.pinID)              // 按下即选中，不等单击判定
+    }
+}
+
+// MARK: - 图钉外观（位图，一次栅格化后长期缓存）
+
+enum PinArt {
+    struct Art {
+        let nsImage: NSImage
+        let size: CGSize
+        /// 图中"应当压在坐标点上"的那一点（相对图片左上角，单位：点）
+        let anchor: CGPoint
+    }
+
+    private enum M {
+        static let pad: CGFloat = 6
+        static let dot: CGFloat = 24
+        static let dotBig: CGFloat = 32
+        static let orderBox: CGFloat = dotBig + pad * 2      // 恒定 44，选中不改尺寸
+        static let riderHeight: CGFloat = dot + pad * 2      // 恒定 36
+        static let capGap: CGFloat = 4
+        static let capPadH: CGFloat = 6
+        static let capExtra: CGFloat = 12
+    }
+
+    private static let capAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+        .foregroundColor: NSColor.labelColor
+    ]
+
+    private static var cache: [String: Art] = [:]
+
+    static func art(isOrder: Bool,
+                    tint: NSColor,
+                    symbol: String,
+                    name: String,
+                    selected: Bool) -> Art? {
+        let key = "\(isOrder)|\(colorKey(tint))|\(symbol)|\(name)|\(selected)"
+        if let hit = cache[key] { return hit }
+        guard let made = render(isOrder: isOrder,
+                                tint: tint,
+                                symbol: symbol,
+                                name: name,
+                                selected: selected) else { return nil }
+        cache[key] = made
+        return made
+    }
+
+    static func colorKey(_ color: NSColor) -> String {
+        guard let c = color.usingColorSpace(.deviceRGB) else { return "?" }
+        return String(format: "%.3f/%.3f/%.3f/%.3f",
+                      c.redComponent, c.greenComponent, c.blueComponent, c.alphaComponent)
+    }
+
+    private static func render(isOrder: Bool,
+                               tint: NSColor,
+                               symbol: String,
+                               name: String,
+                               selected: Bool) -> Art? {
+        let size: CGSize
+        if isOrder {
+            size = CGSize(width: M.orderBox, height: M.orderBox)
+        } else {
+            let textWidth = name.isEmpty
+            ? 0
+            : (name as NSString).size(withAttributes: capAttrs).width.rounded(.up)
+            let width = M.pad * 2 + M.dot
+                + (name.isEmpty ? 0 : M.capGap + textWidth + M.capExtra)
+            size = CGSize(width: width.rounded(), height: M.riderHeight)
+        }
+
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let pxW = max(1, Int((size.width * scale).rounded()))
+        let pxH = max(1, Int((size.height * scale).rounded()))
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: pxW,
+                                         pixelsHigh: pxH,
+                                         bitsPerSample: 8,
+                                         samplesPerPixel: 4,
+                                         hasAlpha: true,
+                                         isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0,
+                                         bitsPerPixel: 0) else { return nil }
+        rep.size = size
+
+        NSGraphicsContext.saveGraphicsState()
+        if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.current = ctx
+            ctx.imageInterpolation = .high
+            let rect = CGRect(origin: .zero, size: size)
+            if isOrder {
+                drawOrderPin(tint: tint, symbol: symbol, selected: selected, in: rect)
+            } else {
+                drawRiderPin(tint: tint, symbol: symbol, name: name, in: rect)
+            }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let nsImage = NSImage(size: size)
+        nsImage.addRepresentation(rep)
+        let anchor = isOrder
+        ? CGPoint(x: size.width / 2, y: size.height / 2)
+        : CGPoint(x: M.pad + M.dot / 2, y: size.height / 2)
+        return Art(nsImage: nsImage, size: size, anchor: anchor)
+    }
+
+    private static func withShadow(alpha: CGFloat, _ body: () -> Void) {
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(alpha)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
+        body()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private static func drawOrderPin(tint: NSColor, symbol: String, selected: Bool, in rect: CGRect) {
+        let d = selected ? M.dotBig : M.dot
+        let lineWidth: CGFloat = selected ? 2.5 : 1.5
+        let circle = CGRect(x: rect.midX - d / 2, y: rect.midY - d / 2, width: d, height: d)
+
+        withShadow(alpha: 0.3) {
+            tint.setFill()
+            NSBezierPath(ovalIn: circle).fill()
+        }
+
+        NSColor.white.setStroke()
+        let ring = NSBezierPath(ovalIn: circle.insetBy(dx: lineWidth / 2, dy: lineWidth / 2))
+        ring.lineWidth = lineWidth
+        ring.stroke()
+
+        drawSymbol(symbol, in: circle, pointSize: d * 0.45)
+    }
+
+    private static func drawRiderPin(tint: NSColor, symbol: String, name: String, in rect: CGRect) {
+        let circle = CGRect(x: M.pad,
+                            y: rect.midY - M.dot / 2,
+                            width: M.dot,
+                            height: M.dot)
+
+        withShadow(alpha: 0.2) {
+            tint.setFill()
+            NSBezierPath(ovalIn: circle).fill()
+        }
+
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        let ring = NSBezierPath(ovalIn: circle.insetBy(dx: 1, dy: 1))
+        ring.lineWidth = 2
+        ring.stroke()
+
+        drawSymbol(symbol, in: circle, pointSize: M.dot * 0.45)
+
+        guard !name.isEmpty else { return }
+        let text = name as NSString
+        let textSize = text.size(withAttributes: capAttrs)
+        let capHeight = (textSize.height + 4).rounded()
+        let capRect = CGRect(x: circle.maxX + M.capGap,
+                             y: rect.midY - capHeight / 2,
+                             width: textSize.width + M.capExtra,
+                             height: capHeight)
+
+        NSColor.controlBackgroundColor.withAlphaComponent(0.92).setFill()
+        NSBezierPath(roundedRect: capRect, xRadius: capHeight / 2, yRadius: capHeight / 2).fill()
+
+        NSColor.white.withAlphaComponent(0.2).setStroke()
+        let capStroke = NSBezierPath(roundedRect: capRect.insetBy(dx: 0.25, dy: 0.25),
+                                     xRadius: capHeight / 2,
+                                     yRadius: capHeight / 2)
+        capStroke.lineWidth = 0.5
+        capStroke.stroke()
+
+        text.draw(at: NSPoint(x: capRect.minX + M.capPadH,
+                              y: capRect.midY - textSize.height / 2),
+                  withAttributes: capAttrs)
+    }
+
+    private static func drawSymbol(_ name: String, in rect: CGRect, pointSize: CGFloat) {
+        let base = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .bold)
+        let config = base.applying(NSImage.SymbolConfiguration(paletteColors: [.white]))
+        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) else { return }
+        let size = symbol.size
+        symbol.draw(in: CGRect(x: rect.midX - size.width / 2,
+                               y: rect.midY - size.height / 2,
+                               width: size.width,
+                               height: size.height))
+    }
+}
+
+// MARK: - 地图宿主
+
+final class MapHostView: NSView, MKMapViewDelegate {
+    let mapView = MKMapView()
+    var onSelectOrder: ((UUID) -> Void)?
+
+    private struct PinSpec {
+        let id: UUID
+        let isOrder: Bool
+        let coordinate: CLLocationCoordinate2D
+        let tint: NSColor
+        let symbol: String
+        let name: String
+        let selected: Bool
+
+        var signature: String {
+            "\(isOrder)|\(name)|\(selected)|\(symbol)|\(PinArt.colorKey(tint))"
+        }
+        var identity: String {
+            "\(id)|\(coordinate.latitude)|\(coordinate.longitude)"
+        }
+    }
+
+    private var specs: [PinSpec] = []
+    private var pinAnnotations: [UUID: PinAnnotation] = [:]
+    private var lastSignature = ""
+
+    private static var initialRegion: MKCoordinateRegion {
+        MKCoordinateRegion(
+            center: GeoPoint.cityCenter.clCoordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.035, longitudeDelta: 0.045)
+        )
+    }
+
+    override var isFlipped: Bool { mapView.isFlipped }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+
+        let config = MKStandardMapConfiguration(elevationStyle: .flat)
+        config.pointOfInterestFilter = .excludingAll
+        mapView.preferredConfiguration = config
+        mapView.showsCompass = true
+        mapView.showsScale = true
+        mapView.delegate = self
+        mapView.translatesAutoresizingMaskIntoConstraints = false
+        mapView.setRegion(Self.initialRegion, animated: false)
+
+        addSubview(mapView)
+        NSLayoutConstraint.activate([
+            mapView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            mapView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            mapView.topAnchor.constraint(equalTo: topAnchor),
+            mapView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+    }
+
+
+    // MARK: 数据同步
+
+    func sync(orders: [Order], riders: [Rider], selected: UUID?) {
+        var newSpecs: [PinSpec] = []
+        newSpecs.reserveCapacity(orders.count + riders.count)
+
+        for order in orders {
+            newSpecs.append(PinSpec(id: order.id,
+                                    isOrder: true,
+                                    coordinate: order.coordinate,
+                                    tint: NSColor(order.status.tint),
+                                    symbol: order.kind.symbol,
+                                    name: "",
+                                    selected: order.id == selected))
+        }
+        for rider in riders {
+            newSpecs.append(PinSpec(id: rider.id,
+                                    isOrder: false,
+                                    coordinate: rider.coordinate,
+                                    tint: .systemGreen,
+                                    symbol: "figure.walk.motion",
+                                    name: rider.name,
+                                    selected: false))
+        }
+
+        let signature = newSpecs.map { $0.signature + "@" + $0.identity }.joined(separator: "~")
+        guard signature != lastSignature else { return }
+        lastSignature = signature
+        specs = newSpecs
+
+        var alive = Set<UUID>()
+        for spec in newSpecs {
+            alive.insert(spec.id)
+            let pin: PinAnnotation
+            if let existing = pinAnnotations[spec.id] {
+                pin = existing
+                if pin.coordinate.latitude != spec.coordinate.latitude
+                    || pin.coordinate.longitude != spec.coordinate.longitude {
+                    pin.coordinate = spec.coordinate
+                }
+            } else {
+                pin = PinAnnotation(id: spec.id,
+                                    isOrder: spec.isOrder,
+                                    coordinate: spec.coordinate)
+                pinAnnotations[spec.id] = pin
+                mapView.addAnnotation(pin)
+            }
+            pin.selected = spec.selected
+            pin.art = PinArt.art(isOrder: spec.isOrder,
+                                 tint: spec.tint,
+                                 symbol: spec.symbol,
+                                 name: spec.name,
+                                 selected: spec.selected)
+            if let view = mapView.view(for: pin) {
+                apply(pin, to: view)
+            }
+        }
+
+        for (id, pin) in pinAnnotations where !alive.contains(id) {
+            mapView.removeAnnotation(pin)
+            pinAnnotations.removeValue(forKey: id)
+        }
+    }
+
+    // MARK: 注释视图
+
+    func mapView(_ mapView: MKMapView, viewFor annotation: any MKAnnotation) -> MKAnnotationView? {
+        guard let pin = annotation as? PinAnnotation else { return nil }
+        let view = PinAnnotationView(annotation: pin, reuseIdentifier: "pin")
+        view.onTap = { [weak self] id in self?.onSelectOrder?(id) }
+        apply(pin, to: view)
+        return view
+    }
+
+    func mapView(_ mapView: MKMapView, didAdd views: [MKAnnotationView]) {
+        // 只关图钉自己的隐式动画；容器是 MapKit 的，绝不要碰
+        for view in views {
+            view.layer?.actions = PinAnnotationView.frozenActions
+        }
+    }
+
+    /// art.anchor 是图片里"应当压在地图坐标上"的那一点，换算成 MapKit 的中心偏移
+    private func apply(_ pin: PinAnnotation, to view: MKAnnotationView) {
+        guard let art = pin.art else { return }
+        if view.image !== art.nsImage {
+            view.image = art.nsImage
+        }
+        let offset = CGPoint(x: art.size.width / 2 - art.anchor.x,
+                             y: art.size.height / 2 - art.anchor.y)
+        if view.centerOffset != offset {
+            view.centerOffset = offset
+        }
+        let priority: MKAnnotationViewZPriority = pin.selected ? .max : .defaultUnselected
+        if view.zPriority != priority {
+            view.zPriority = priority
+        }
+    }
+
+    // MARK: 相机
+
+    func fly(to point: GeoPoint) {
+        let region = MKCoordinateRegion(
+            center: point.clCoordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.011)
+        )
+        mapView.setRegion(region, animated: true)
+    }
+
+    func fitAll() {
+        let coords = specs.map(\.coordinate)
+        guard let first = coords.first else { return }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLng = first.longitude, maxLng = first.longitude
+        for c in coords {
+            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
+            minLng = min(minLng, c.longitude); maxLng = max(maxLng, c.longitude)
+        }
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
+                                            longitude: (minLng + maxLng) / 2)
+        let span = MKCoordinateSpan(
+            latitudeDelta: max(0.012, (maxLat - minLat) * 1.5),
+            longitudeDelta: max(0.016, (maxLng - minLng) * 1.5)
+        )
+        mapView.setRegion(MKCoordinateRegion(center: center, span: span), animated: true)
+    }
+}
+
+// MARK: - 卡片条
+
+private struct MapOrderChip: View {
+    let order: Order
+    let isSelected: Bool
+    let distance: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: order.kind.symbol)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(order.kind.title)
+                    .font(.system(size: 10, weight: .semibold))
+                Spacer(minLength: 6)
+                Text(order.status.title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(order.status.tint)
+            }
+
+            Text(order.addressLine)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+
+            HStack(spacing: 4) {
+                if let distance {
+                    Image(systemName: "location.north.line")
+                        .font(.system(size: 8))
+                    Text(distanceText(distance))
+                        .font(.system(size: 9, design: .rounded))
+                }
+                Spacer(minLength: 4)
+                Text(Theme.money(order.fee))
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+            }
+            .foregroundStyle(.secondary)
+        }
+        .padding(9)
+        .frame(width: 148, alignment: .leading)
+        .glassEffect(
+            isSelected
+            ? .regular.tint(order.status.tint.opacity(0.35)).interactive()
+            : .regular.interactive(),
+            in: .rect(cornerRadius: 11)
+        )
+    }
+
+    private func distanceText(_ meters: Double) -> String {
+        meters < 1000
+        ? "\(Int(meters)) m"
+        : String(format: "%.1f km", meters / 1000)
+    }
+}
+
+// MARK: - 坐标桥接
+
+extension Order {
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: resolvedLocation.latitude,
+                               longitude: resolvedLocation.longitude)
+    }
+}
+
+extension Rider {
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: resolvedLocation.latitude,
+                               longitude: resolvedLocation.longitude)
+    }
+}
+
+#Preview {
+    SplitBoard()
+        .environment(WorkbenchStore())
+        .frame(width: 1000, height: 760)
+}

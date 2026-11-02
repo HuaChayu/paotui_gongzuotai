@@ -1,17 +1,13 @@
 import SwiftUI
-import Playgrounds
 
 struct ContentView: View {
     var body: some View {
-        Text("Hello, world!")
-            .padding()
+        RootTabs()
     }
 }
 
 #Preview {
     ContentView()
-}
-
-#Playground {
-    _ = 1 + 2
+        .environment(WorkbenchStore())
+        .frame(width: 1440, height: 900)
 }
